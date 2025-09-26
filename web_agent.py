@@ -6,9 +6,9 @@ Local web UI for checking SOCKS5 proxies against IPQualityScore.
 - On submit, the pasted key is saved to per-user .env so it persists across launches.
 - Drops ALL proxies for any IP that appears more than once (only unique-IP proxies remain).
 - Displays proxies as host:port:login:password (login/password blank if none).
-- Verdict colors: 0 -> green ✓, 1–20 -> orange ✓, >20 -> red ✗.
-- Copy textarea for proxies with fraud_score ≤ 20.
-- Saves CSV + two TXT files to outbox/: *_proxies_eq0.txt and *_proxies_le20.txt.
+- Verdict colors: 0 -> green ✓, 1–28 -> black ✓, >28 -> red ✗.
+- Copy textarea for proxies with fraud_score ≤ 28.
+- Saves CSV + two TXT files to outbox/: *_proxies_eq0.txt and *_proxies_le28.txt.
 - Uses a stable per-user data folder (see user_data_root()) so packaging is safe.
 - Binds ONLY to 127.0.0.1 (do not expose publicly).
 """
@@ -47,7 +47,7 @@ DB_PATH = ROOT / "ip_cache.sqlite3"            # cache db lives here
 
 IPIFY_URL   = "https://api.ipify.org?format=json"
 IPQS_BASE   = "https://ipqualityscore.com/api/json/ip"
-BATCH_SIZE  = 50                # parallelism for proxy/IP checks
+BATCH_SIZE  = 50                # parallelism for proxy/IP checks (input size unlimited)
 REQ_TIMEOUT = 15                # seconds per HTTP request
 CACHE_MAX_AGE_DAYS = 7          # re-check IPQS after this many days
 
@@ -56,7 +56,15 @@ DB_LOCK = threading.RLock()     # thread-safety for SQLite
 
 # Load .env from per-user data folder; GUI key overrides this.
 load_dotenv(dotenv_path=ROOT / ".env")
-ENV_API_KEY = os.getenv("IPQS_API_KEY", "").strip()
+
+def _env_api_keys():
+    raw_many = os.getenv("IPQS_API_KEYS", "").strip()
+    if raw_many:
+        return [k.strip() for k in re.split(r"[\s,]+", raw_many) if k.strip()]
+    raw_one = os.getenv("IPQS_API_KEY", "").strip()
+    return [raw_one] if raw_one else []
+
+ENV_API_KEYS = _env_api_keys()
 
 app = Flask(__name__, static_folder=None)
 app.secret_key = os.urandom(16)  # for session storage
@@ -171,15 +179,31 @@ def get_ip_via_proxy(proxy_url: str):
         return False, f"error: {e}"
 
 def query_ipqs(api_key: str, ip: str):
-    """Return dict with IPQS response."""
+    """Return dict with IPQS response using strictness=3 (very strict)."""
     url = f"{IPQS_BASE}/{api_key}/{ip}"
     try:
-        r = requests.get(url, params={"strictness": 0}, timeout=REQ_TIMEOUT)
+        r = requests.get(url, params={"strictness": 3}, timeout=REQ_TIMEOUT)
         if r.status_code == 200:
             return r.json()
         return {"success": False, "message": f"status {r.status_code}", "_body": r.text[:400]}
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": str(e)}
+
+def _is_limit_error(resp: dict) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    msg = (resp.get("message") or "").lower()
+    return any(s in msg for s in ["limit", "usage", "exhaust", "credit"]) and resp.get("success") is False
+
+def query_ipqs_with_keys(api_keys: list[str], ip: str):
+    """Try multiple API keys until one succeeds or non-limit error encountered."""
+    last_resp = {"success": False, "message": "no api key provided"}
+    for key in [k for k in (api_keys or []) if k]:
+        resp = query_ipqs(key, ip)
+        if not _is_limit_error(resp):
+            return resp
+        last_resp = resp
+    return last_resp
 
 def verdict_icon(fraud_score):
     """Return HTML icon based on fraud_score."""
@@ -191,15 +215,16 @@ def verdict_icon(fraud_score):
         return '<span style="color:#999">?</span>'
     if fs == 0:
         return '<span style="color:#0a8a0a;font-weight:bold;">✓</span>'   # green
-    if 1 <= fs <= 20:
-        return '<span style="color:#e67e00;font-weight:bold;">✓</span>'   # orange
+    if 1 <= fs <= 28:
+        return '<span style="color:#000000;font-weight:bold;">✓</span>'   # black
     return '<span style="color:#c32020;font-weight:bold;">✗</span>'       # red
 
-def save_env_api_key(key: str):
-    """Persist API key in per-user data dir so it survives restarts."""
+def save_env_api_keys(keys: list[str]):
+    """Persist API keys in per-user data dir so they survive restarts."""
     env_path = ROOT / ".env"
     try:
-        env_path.write_text(f"IPQS_API_KEY={key}\n", encoding="utf-8")
+        joined = ",".join([k for k in keys if k])
+        env_path.write_text(f"IPQS_API_KEYS={joined}\n", encoding="utf-8")
     except Exception:
         pass
 
@@ -212,7 +237,7 @@ def clear_saved_api_key():
             p.unlink()
 
 
-def process_paste_and_build_rows(conn, api_key: str, text: str):
+def process_paste_and_build_rows(conn, api_keys, text: str):
     """
     Accepts raw pasted text (one proxy per line).
     Returns: (rows_list, csv_filename, txt_eq0_filename, txt_le20_filename,
@@ -262,7 +287,7 @@ def process_paste_and_build_rows(conn, api_key: str, text: str):
             if "fraud_score" not in data:
                 data["fraud_score"] = cached["fraud_score"]
             return ip, data, True
-        data = query_ipqs(api_key, ip)
+        data = query_ipqs_with_keys(api_keys, ip)
         fraud_score = data.get("fraud_score")
         if fraud_score is not None:
             cache_put(conn, ip, fraud_score, data)
@@ -276,7 +301,7 @@ def process_paste_and_build_rows(conn, api_key: str, text: str):
 
     # 5) Build rows for UI/CSV using ONLY kept unique-IP proxies
     rows = []
-    list_le20 = []  # formatted proxies with fraud_score ≤ 20
+    list_le28 = []  # formatted proxies with fraud_score ≤ 28
     list_eq0  = []  # formatted proxies with fraud_score == 0
 
     for proxy_url, ip, formatted in kept:
@@ -291,8 +316,8 @@ def process_paste_and_build_rows(conn, api_key: str, text: str):
         except Exception:
             fs_int = None
 
-        if fs_int is not None and fs_int <= 20:
-            list_le20.append(formatted)
+        if fs_int is not None and fs_int <= 28:
+            list_le28.append(formatted)
         if fs_int == 0:
             list_eq0.append(formatted)
 
@@ -313,7 +338,7 @@ def process_paste_and_build_rows(conn, api_key: str, text: str):
     timestamp = _utcnow().strftime("%Y%m%d_%H%M%S")
     csv_name      = f"{timestamp}_results.csv"
     txt_eq0_name  = f"{timestamp}_proxies_eq0.txt"
-    txt_le20_name = f"{timestamp}_proxies_le20.txt"
+    txt_le20_name = f"{timestamp}_proxies_le28.txt"
     df.to_csv(OUTBOX / csv_name, index=False, encoding="utf-8")
 
     # write lists
@@ -321,11 +346,11 @@ def process_paste_and_build_rows(conn, api_key: str, text: str):
         for line in list_eq0:
             f.write(line + "\n")
     with (OUTBOX / txt_le20_name).open("w", encoding="utf-8") as f:
-        for line in list_le20:
+        for line in list_le28:
             f.write(line + "\n")
 
     # textarea payload for copy
-    copy_payload = "\n".join(list_le20)
+    copy_payload = "\n".join(list_le28)
 
     return rows, csv_name, txt_eq0_name, txt_le20_name, dropped_dupes, kept_count, copy_payload
 
@@ -363,7 +388,7 @@ INDEX_HTML = """
   <p class="muted">Data folder: <code>{{ data_dir }}</code></p>
 
   <form method="post" action="{{ url_for('submit') }}">
-    <p><strong>IPQS API Key</strong></p>
+    <p><strong>IPQS API Key(s)</strong> <span class="muted">(paste one or many, separated by comma or whitespace; rotates on limit)</span></p>
     <div class="row">
       <input id="apiKey" type="password" name="api_key" placeholder="Paste your IPQS API key" value="{{ api_key_prefill }}" autocomplete="off">
       <button class="iconbtn" type="button" onclick="toggleEye()" title="Show/Hide API key" aria-label="Show or hide API key">
@@ -383,14 +408,14 @@ socks5://user:pass@5.6.7.8:1080
 user:pass@8.8.8.8:1080"></textarea><br><br>
     <button class="btn" type="submit">Submit & Process</button>
   </form>
-  <p class="muted">Plain <code>host:port</code> or <code>user:pass@host:port</code> are OK — we'll auto-prefix <code>socks5://</code>. Batch size = {{ batch_size }}. Only unique-IP proxies are kept; all duplicates (by IP) are removed.</p>
+  <p class="muted">Plain <code>host:port</code> or <code>user:pass@host:port</code> are OK — we'll auto-prefix <code>socks5://</code>. No hard limit on how many you paste; processing uses {{ batch_size }} parallel workers. Only unique-IP proxies are kept; all duplicates (by IP) are removed.</p>
 
   {% if note %}
     <div class="note">{{ note }}</div>
   {% endif %}
 
   {% if rows %}
-    <h3>Results ({{ rows|length }} rows) — verdicts: <span style="color:#0a8a0a;font-weight:bold;">✓</span>=0, <span style="color:#e67e00;font-weight:bold;">✓</span>≤20, <span style="color:#c32020;font-weight:bold;">✗</span>>20</h3>
+    <h3>Results ({{ rows|length }} rows) — verdicts: <span style="color:#0a8a0a;font-weight:bold;">✓</span>=0, <span style="color:#000000;font-weight:bold;">✓</span>≤28, <span style="color:#c32020;font-weight:bold;">✗</span>>28</h3>
     <table>
       <thead>
         <tr>
@@ -418,18 +443,18 @@ user:pass@8.8.8.8:1080"></textarea><br><br>
       </tbody>
     </table>
 
-    <h3>Copy proxies with fraud score ≤ 20</h3>
+    <h3>Copy proxies with fraud score ≤ 28</h3>
     <div class="flex">
-      <button class="btn" type="button" onclick="copyLe20()">Copy to clipboard</button>
+      <button class="btn" type="button" onclick="copyLe28()">Copy to clipboard</button>
       <span class="muted">Format: <code>host:port:login:password</code></span>
     </div>
-    <textarea id="le20" rows="8">{{ copy_payload }}</textarea>
+    <textarea id="le28" rows="8">{{ copy_payload }}</textarea>
 
     {% if csv_name and txt_eq0_name and txt_le20_name %}
     <p class="files">
       CSV: <a href="{{ url_for('download', filename=csv_name) }}">{{ csv_name }}</a> |
       =0 TXT: <a href="{{ url_for('download', filename=txt_eq0_name) }}">{{ txt_eq0_name }}</a> |
-      ≤20 TXT: <a href="{{ url_for('download', filename=txt_le20_name) }}">{{ txt_le20_name }}</a>
+      ≤28 TXT: <a href="{{ url_for('download', filename=txt_le20_name) }}">{{ txt_le20_name }}</a>
     </p>
     {% endif %}
   {% endif %}
@@ -464,8 +489,8 @@ user:pass@8.8.8.8:1080"></textarea><br><br>
         icon.outerHTML = eye;
       }
     }
-    function copyLe20() {
-      const ta = document.getElementById('le20');
+    function copyLe28() {
+      const ta = document.getElementById('le28');
       ta.select();
       ta.setSelectionRange(0, 99999);
       const ok = document.execCommand('copy');
@@ -487,7 +512,7 @@ def index():
     files = sorted([p for p in OUTBOX.iterdir() if p.is_file()],
                    key=lambda p: p.stat().st_mtime, reverse=True)[:20]
     files_with_time = [(p.name, datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")) for p in files]
-    api_key_prefill = (session.get("api_key") or ENV_API_KEY or "")
+    api_key_prefill = (session.get("api_key") or (",".join(ENV_API_KEYS) if ENV_API_KEYS else ""))
     return render_template_string(
         INDEX_HTML,
         rows=None, csv_name=None, txt_eq0_name=None, txt_le20_name=None, files=files_with_time,
@@ -509,18 +534,21 @@ def reset_saved_key():
 def submit():
     pasted_key = (request.form.get("api_key") or "").strip()
     if pasted_key:
-        session["api_key"] = pasted_key
-        save_env_api_key(pasted_key)  # persist for next launches
+        keys = [k.strip() for k in re.split(r"[\s,]+", pasted_key) if k.strip()]
+        session["api_key"] = ",".join(keys)
+        save_env_api_keys(keys)  # persist for next launches
 
-    api_key = session.get("api_key") or ENV_API_KEY
+    # prefer session keys; fallback to env keys
+    session_keys = [k.strip() for k in re.split(r"[\s,]+", session.get("api_key") or "") if k.strip()]
+    effective_keys = session_keys if session_keys else ENV_API_KEYS
 
     text = request.form.get("proxies", "")
     files = sorted([p for p in OUTBOX.iterdir() if p.is_file()],
                    key=lambda p: p.stat().st_mtime, reverse=True)[:20]
     files_with_time = [(p.name, datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")) for p in files]
-    api_key_prefill = session.get("api_key") or ENV_API_KEY or ""
+    api_key_prefill = session.get("api_key") or (",".join(ENV_API_KEYS) if ENV_API_KEYS else "")
 
-    if not api_key:
+    if not effective_keys:
         return render_template_string(
             INDEX_HTML,
             rows=None, csv_name=None, txt_eq0_name=None, txt_le20_name=None, files=files_with_time,
@@ -537,7 +565,7 @@ def submit():
 
     try:
         (rows, csv_name, txt_eq0_name, txt_le20_name,
-         dropped_dupes, kept_count, copy_payload) = process_paste_and_build_rows(CONN, api_key, text)
+         dropped_dupes, kept_count, copy_payload) = process_paste_and_build_rows(CONN, effective_keys, text)
         note = f"Processed. Removed {dropped_dupes} proxies because their exit IPs were duplicated. Kept {kept_count} unique-IP proxies."
         if kept_count == 0:
             note += " (All proxies shared duplicated IPs; nothing left after filtering.)"
@@ -558,7 +586,7 @@ def submit():
     files = sorted([p for p in OUTBOX.iterdir() if p.is_file()],
                    key=lambda p: p.stat().st_mtime, reverse=True)[:20]
     files_with_time = [(p.name, datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")) for p in files]
-    api_key_prefill = session.get("api_key") or ENV_API_KEY or ""
+    api_key_prefill = session.get("api_key") or (",".join(ENV_API_KEYS) if ENV_API_KEYS else "")
 
     return render_template_string(
         INDEX_HTML,
